@@ -14,9 +14,7 @@ import napari
 import cv2
 import matplotlib.pyplot as plt
 from IPython.core.display import display
-from tqdm.notebook import tqdm
-import torch
-import torchvision
+from tqdm import tqdm
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 import argparse
@@ -25,8 +23,8 @@ import napari_lazy_openslide
 import openslide
 
 parser=argparse.ArgumentParser()
-parser.add_argument('--filepath', default = 'S12-13045-1-A-9_12-2414')
-
+parser.add_argument('--filePath', default = 'E:/Data/dhsr/RD/S12-13045-1-A-9_12-2414.scn')
+parser.add_argument('--featurePath', default = 'E:/Data/dhsr/features/S12-13045-1-A-9_12-2414_resnet50_tile-1024_level-1_pca-50.npz')
 args = parser.parse_args()
 
 
@@ -34,13 +32,13 @@ args = parser.parse_args()
 # In[34]:
 
 
-filename_wsi = os.path.basename(args.filepath).replace('.scn','')
+filename_wsi = os.path.basename(args.filePath).replace('.scn','')
 
 
 # In[35]:
 
 
-path = args.filepath
+path = args.filePath
 # path = '/home/reasat/data/dhsr/RD/S12-10712-1-B-2_12-2010.scn'
 # path = '/home/reasat/data/dhsr/RD/S12-13562-1-A-6_12-2529.scn'
 
@@ -80,6 +78,9 @@ for i in range(len(regions_dict)//4):
 
 
 img, prop = napari_lazy_openslide.lazy_openslide.reader_function(path)[0]
+X_OFF = regions_dict_rf['region-0']['x']
+Y_OFF = regions_dict_rf['region-0']['y']
+tile_size = 1024
 
 def create_square(x,y,tile_size):
     return [[y,x],
@@ -88,19 +89,63 @@ def create_square(x,y,tile_size):
             [y,x+tile_size]
            ]
 
+def create_square(x, y, tile_size):
+    return [[y, x],
+            [y + tile_size, x],
+            [y + tile_size, x + tile_size],
+            [y, x + tile_size]
+            ]
 
 
-X_OFF = regions_dict_rf['region-0']['x']
-Y_OFF = regions_dict_rf['region-0']['y']
+def has_tissue(wsi, x, y, tile_size, downsample_level=1):
+    tile = wsi.read_region(
+        location=(np.uint32(x), np.uint32(y)),
+        level=downsample_level,
+        size=(np.uint32(tile_size // wsi.level_downsamples[downsample_level]),
+              np.uint32(tile_size // wsi.level_downsamples[downsample_level]))
+    )
+    tile = np.array(tile)[:, :, :3]
+    mean = tile.reshape((-1, 3)).mean(axis=0)
+    return ((mean < np.array([225] * 3)).all())
 
+def make_int_rev(coord):
+    x=np.uint32(X_OFF+(coord[1]-X_OFF)//tile_size*tile_size)
+    y=np.uint32(Y_OFF+(coord[0]-Y_OFF)//tile_size*tile_size)
+    return x,y
+
+x_list = []
+y_list = []
+for key in regions_dict_rf.keys():
+    region = regions_dict_rf[key]
+    y = np.arange(region['y'],
+                  region['y'] + region['height'] // tile_size * tile_size,
+                  tile_size)
+    x = np.arange(region['x'],
+                  region['x'] + region['width'] // tile_size * tile_size,
+                  tile_size)
+    x_list.append(x)
+    y_list.append(y)
+
+yv, xv = np.meshgrid(np.concatenate(np.array(y_list)),
+                     np.concatenate(np.array(x_list)))
+xv = xv.flatten()
+yv = yv.flatten()
+
+grid_tissue, tissue_coords = zip(
+    *[(create_square(x, y, tile_size), (x, y)) for x, y in zip(tqdm(xv), yv) if has_tissue(wsi, x, y, tile_size)])
+print('No. of tiles with tissues', len(grid_tissue))
+
+npz = np.load(args.featurePath)
+features = npz['features_pca']
+
+coord_feat_dict = {c: f for f, c in zip(features, tissue_coords)}
 
 with napari.gui_qt():
     viewer = napari.view_image(img)
-    vayer_img = viewer.layers['img']
-    tile_size = 1024
+    layer_img = viewer.layers['img']
     points_layer_bg = viewer.add_points(
         name='points_bg',
-        size = 50,
+        size = 100,
         face_color= 'blue'
     )
     shapes_layer_bg = viewer.add_shapes(name='tiles_bg',
@@ -111,15 +156,24 @@ with napari.gui_qt():
     @points_layer_bg.mouse_drag_callbacks.append
     def get_coord_bg(layer,event):
         if layer.mode == 'add':
-            coord = layer.coordinates
+            coord = make_int_rev(layer.coordinates)
+            if coord not in coord_feat_dict.keys():
+                # layer.remove_selected()
+                print('Warning: Coord {} not found in feature list, maybe no tissue tile?'.format(coord))
+            #         print(coord)
+            # else:
             shape = create_square(
-            X_OFF+(coord[1]-X_OFF)//tile_size*tile_size,
-            Y_OFF+(coord[0]-Y_OFF)//tile_size*tile_size, 
-            tile_size
-        )
-           
+                coord[0], coord[1],
+                tile_size
+            )
+
             shapes_layer_bg.add(shape)
-    
+            # print('point num', len(layer.data))
+            # print('shape num', len(shapes_layer_bg.data))
+            # print('points', layer.data)
+            # print('shapes', shapes_layer_bg.data)
+
+
     @points_layer_bg.bind_key('Backspace')
     @points_layer_bg.bind_key('Delete')
     def delete_selected(layer):
@@ -131,7 +185,7 @@ with napari.gui_qt():
     
     points_layer_fg = viewer.add_points(
         name='points_fg', 
-        size=50, 
+        size=100,
         face_color='green'
     )
     shapes_layer_fg = viewer.add_shapes(
@@ -144,14 +198,16 @@ with napari.gui_qt():
     @points_layer_fg.mouse_drag_callbacks.append
     def get_coord_fg(layer,event):
         if layer.mode == 'add':
-            coord = layer.coordinates
-    #         print(coord)
+            coord = make_int_rev(layer.coordinates)
+            if coord not in coord_feat_dict.keys():
+                # layer.remove_selected()
+                print('Warning: Coord {} not found in feature list, maybe no tissue tile?'.format(coord))
+            # else:
             shape = create_square(
-            X_OFF+(coord[1]-X_OFF)//tile_size*tile_size,
-            Y_OFF+(coord[0]-Y_OFF)//tile_size*tile_size, 
-            tile_size
-        )
-    #         print(shape)
+                coord[0], coord[1],
+                tile_size
+            )
+#         print(shape)
             shapes_layer_fg.add(shape)
     #         print(shape)
     
@@ -161,51 +217,14 @@ with napari.gui_qt():
     def delete_selected(layer):
         """Delete all selected points."""
         if str( layer._mode) in ('select', 'add'):
+            print(points_layer_fg.selected_data)
             shapes_layer_fg.selected_data = points_layer_fg.selected_data
             shapes_layer_fg.remove_selected()
             layer.remove_selected()
     
-    x_list = []
-    y_list = []
-    for key in regions_dict_rf.keys():
-        region = regions_dict_rf[key]
-        y = np.arange(region['y'],
-                      region['y']+region['height']//tile_size*tile_size,
-                      tile_size)
-        x = np.arange(region['x'],
-                      region['x']+region['width']//tile_size*tile_size,
-                      tile_size)
-        x_list.append(x)
-        y_list.append(y)
+
     
-    yv, xv = np.meshgrid(np.concatenate(np.array(y_list)),
-                         np.concatenate(np.array(x_list)))
-    xv = xv.flatten()
-    yv = yv.flatten()
-    
-    def create_square(x,y,tile_size):
-        return [[y,x],
-                [y+tile_size,x],
-                [y+tile_size,x+tile_size],
-                [y,x+tile_size]
-               ]
-    
-    
-    def has_tissue(wsi, x,y,tile_size,downsample_level=1):
-        tile = wsi.read_region(
-                location= (np.uint32(x),np.uint32(y)),
-                level = downsample_level,
-                size = (np.uint32(tile_size//wsi.level_downsamples[downsample_level]),
-                       np.uint32(tile_size//wsi.level_downsamples[downsample_level]))
-            )
-        tile = np.array(tile)[:,:,:3]
-        mean = tile.reshape((-1,3)).mean(axis=0)
-        return ((mean<np.array([225]*3)).all())
-    
-    
-    grid_tissue, tissue_coords = zip(*[(create_square(x,y,tile_size), (x,y)) for x,y in zip(tqdm(xv),yv)           if has_tissue(wsi, x,y,tile_size)])
-    print(len(grid_tissue))
-    
+
     
     layer_tiles = viewer.add_shapes(grid_tissue, 
                                       shape_type='polygon',
@@ -216,32 +235,43 @@ with napari.gui_qt():
                                       opacity = 0.5
                                      )
     
-    
-    npz = np.load('/home/reasat/data/dhsr/features/{}_resnet50_tile-1024_level-1_pca-50.npz'.format(filename_wsi))
-    features = npz['features_pca']
-    
-    coord_feat_dict = {c:f for f,c in zip(features,tissue_coords)}
-    
-    
-    
-    def make_int(coord):
-        x=np.uint32(X_OFF+(coord[1]-X_OFF)//tile_size*tile_size)
-        y=np.uint32(Y_OFF+(coord[0]-Y_OFF)//tile_size*tile_size)
-        return x,y
-    
-    
+
     
     @viewer.bind_key('Control-r', overwrite = True)
     def classify(viewer):
         #todo better indexing of selected features rather than recalculation?
         print('classifying')
-        print('fg samples',len(points_layer_fg.data))
-        print('bg samples',len(points_layer_bg.data))
+
+        print('fg samples (points)',len(points_layer_fg.data))
+        print('bg samples (points)',len(points_layer_bg.data))
+
+        print('fg samples (tiles)', len(shapes_layer_fg.data))
+        print('bg samples (tiles)', len(shapes_layer_bg.data))
+
+        print('removing redundant tiles ...')
+
+        set_fg = [i for i, coord in enumerate(viewer.layers['points_fg'].data) if make_int_rev(coord) not in coord_feat_dict.keys()]
+        set_bg = [i for i, coord in enumerate(viewer.layers['points_bg'].data) if make_int_rev(coord) not in coord_feat_dict.keys()]
+        shapes_layer_fg.selected_data = set(set_fg)
+        shapes_layer_fg.remove_selected()
+        shapes_layer_bg.selected_data = set(set_bg)
+        shapes_layer_bg.remove_selected()
+        points_layer_fg.selected_data = set(set_fg)
+        points_layer_fg.remove_selected()
+        points_layer_bg.selected_data = set(set_bg)
+        points_layer_bg.remove_selected()
+
+        print('fg samples (points)', len(points_layer_fg.data))
+        print('bg samples (points)', len(points_layer_bg.data))
+
+        print('fg samples (tiles)', len(shapes_layer_fg.data))
+        print('bg samples (tiles)', len(shapes_layer_bg.data))
+
         features_selected_fg = np.array(
-            [coord_feat_dict[make_int(coord)] for coord in viewer.layers['points_fg'].data]
+            [coord_feat_dict[make_int_rev(coord)] for coord in viewer.layers['points_fg'].data]
         )
         features_selected_bg = np.array(
-            [coord_feat_dict[make_int(coord)] for coord in viewer.layers['points_bg'].data]
+            [coord_feat_dict[make_int_rev(coord)] for coord in viewer.layers['points_bg'].data]
         )
         
         clf = LogisticRegression(random_state=0).fit(
